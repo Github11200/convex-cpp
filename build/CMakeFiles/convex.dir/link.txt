@@ -1,2 +1,0 @@
-/usr/bin/ar qc libconvex.a CMakeFiles/convex.dir/src/value.cpp.o CMakeFiles/convex.dir/src/protocol.cpp.o CMakeFiles/convex.dir/src/base_client.cpp.o CMakeFiles/convex.dir/src/client.cpp.o CMakeFiles/convex.dir/src/transport.cpp.o CMakeFiles/convex.dir/src/platform/posix_transport.cpp.o
-/usr/bin/ranlib libconvex.a
