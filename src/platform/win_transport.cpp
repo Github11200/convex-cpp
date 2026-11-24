@@ -8,8 +8,6 @@
 #include <string>
 #include <stdexcept>
 
-#pragma comment(lib, "winhttp.lib")
-
 namespace convex {
 
 namespace {
@@ -19,14 +17,6 @@ std::wstring to_wide(const std::string& str) {
     int size = MultiByteToWideChar(CP_UTF8, 0, str.c_str(), -1, nullptr, 0);
     std::wstring result(size - 1, 0);
     MultiByteToWideChar(CP_UTF8, 0, str.c_str(), -1, &result[0], size);
-    return result;
-}
-
-std::string from_wide(const std::wstring& str) {
-    if (str.empty()) return "";
-    int size = WideCharToMultiByte(CP_UTF8, 0, str.c_str(), -1, nullptr, 0, nullptr, nullptr);
-    std::string result(size - 1, 0);
-    WideCharToMultiByte(CP_UTF8, 0, str.c_str(), -1, &result[0], size, nullptr, nullptr);
     return result;
 }
 
@@ -242,7 +232,8 @@ bool WinTransport::send(const std::string& message) {
     return err == ERROR_SUCCESS;
 }
 
-void WinTransport::close(const std::string& reason) {
+void WinTransport::close(const std::string&) {
+    partial_message_.clear();
     if (websocket_) {
         state_ = ConnectionState::Closing;
         WinHttpWebSocketClose(
@@ -275,7 +266,7 @@ void WinTransport::set_callbacks(TransportCallbacks callbacks) {
     callbacks_ = std::move(callbacks);
 }
 
-void WinTransport::poll(int timeout_ms) {
+void WinTransport::poll(int) {
     if (!websocket_ || state_ != ConnectionState::Connected) {
         return;
     }

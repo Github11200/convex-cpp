@@ -18,6 +18,7 @@ enum class ConnectionState {
     Connected,
     Closing
 };
+using WebSocketState = ConnectionState;
 
 /**
  * Transport event callbacks

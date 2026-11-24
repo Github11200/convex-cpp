@@ -2,6 +2,7 @@
 #include "../third_party/nlohmann_json.hpp"
 #include <stdexcept>
 #include <cmath>
+#include <bit>
 
 using json = nlohmann::json;
 
@@ -80,12 +81,13 @@ std::vector<uint8_t> base64_decode_bytes(const std::string& encoded) {
         if (valid_chars >= 4) result.push_back(static_cast<uint8_t>(n & 0xFF));
     }
     
+    if (base64_encode_bytes(result.data(), result.size()) != encoded) {
+        throw std::runtime_error("Invalid base64 encoding");
+    }
     return result;
 }
 
-// Base64 encode for Int64 (JavaScript BigInt compatibility)
-// Int64 is encoded as little-endian 8 bytes, then base64
-std::string encode_int64(int64_t value) {
+std::string encode_le64(uint64_t value) {
     uint8_t bytes[8];
     for (int i = 0; i < 8; ++i) {
         bytes[i] = static_cast<uint8_t>((value >> (i * 8)) & 0xFF);
@@ -93,31 +95,36 @@ std::string encode_int64(int64_t value) {
     return base64_encode_bytes(bytes, 8);
 }
 
-// Decode base64 to Int64
-int64_t decode_int64(const std::string& encoded) {
+uint64_t decode_le64(const std::string& encoded) {
     auto bytes = base64_decode_bytes(encoded);
-    
-    int64_t result = 0;
-    for (size_t i = 0; i < bytes.size() && i < 8; ++i) {
-        result |= static_cast<int64_t>(bytes[i]) << (i * 8);
+    if (bytes.size() != 8) throw std::runtime_error("Expected an eight-byte number");
+
+    uint64_t result = 0;
+    for (size_t i = 0; i < 8; ++i) {
+        result |= uint64_t{bytes[i]} << (i * 8);
     }
     return result;
 }
 
-// Convert Value to JSON
-json value_to_json(const Value& v) {
+enum class JsonFormat { Sync, Export };
+
+json value_to_json(const Value& v, JsonFormat format = JsonFormat::Sync) {
     switch (v.type()) {
         case Value::Type::Null:
             return nullptr;
         case Value::Type::Int64:
+            if (format == JsonFormat::Export) return std::to_string(v.as_int64());
             // Convex encodes Int64 as {"$integer": "base64"}
-            return json{{"$integer", encode_int64(v.as_int64())}};
+            return json{{"$integer", encode_le64(std::bit_cast<uint64_t>(v.as_int64()))}};
         case Value::Type::Float64: {
             double d = v.as_float64();
-            if (std::isnan(d)) {
-                return json{{"$float", "NaN"}};
-            } else if (std::isinf(d)) {
-                return json{{"$float", d > 0 ? "Infinity" : "-Infinity"}};
+            if (format == JsonFormat::Export) {
+                if (std::isnan(d)) return "NaN";
+                if (std::isinf(d)) return std::signbit(d) ? "-Infinity" : "Infinity";
+                return d;
+            }
+            if (!std::isfinite(d) || (d == 0 && std::signbit(d))) {
+                return json{{"$float", encode_le64(std::bit_cast<uint64_t>(d))}};
             }
             return d;
         }
@@ -128,19 +135,21 @@ json value_to_json(const Value& v) {
         case Value::Type::Bytes: {
             // Convex encodes Bytes as {"$bytes": "base64"}
             const auto& bytes = v.as_bytes();
-            return json{{"$bytes", base64_encode_bytes(bytes.data(), bytes.size())}};
+            auto encoded = base64_encode_bytes(bytes.data(), bytes.size());
+            if (format == JsonFormat::Export) return encoded;
+            return json{{"$bytes", std::move(encoded)}};
         }
         case Value::Type::Array: {
             json arr = json::array();
             for (const auto& elem : v.as_array()) {
-                arr.push_back(value_to_json(elem));
+                arr.push_back(value_to_json(elem, format));
             }
             return arr;
         }
         case Value::Type::Object: {
             json obj = json::object();
             for (const auto& [key, val] : v.as_object()) {
-                obj[key] = value_to_json(val);
+                obj[key] = value_to_json(val, format);
             }
             return obj;
         }
@@ -154,9 +163,7 @@ Value json_to_value(const json& j) {
         return Value();
     } else if (j.is_boolean()) {
         return Value(j.get<bool>());
-    } else if (j.is_number_integer()) {
-        return Value(static_cast<int64_t>(j.get<int64_t>()));
-    } else if (j.is_number_float()) {
+    } else if (j.is_number()) {
         return Value(j.get<double>());
     } else if (j.is_string()) {
         return Value(j.get<std::string>());
@@ -168,19 +175,19 @@ Value json_to_value(const json& j) {
         return Value(std::move(arr));
     } else if (j.is_object()) {
         // Check for special Convex types
-        if (j.contains("$integer")) {
-            return Value(decode_int64(j["$integer"].get<std::string>()));
-        } else if (j.contains("$float")) {
-            std::string s = j["$float"].get<std::string>();
-            if (s == "NaN") return Value(std::nan(""));
-            if (s == "Infinity") return Value(std::numeric_limits<double>::infinity());
-            if (s == "-Infinity") return Value(-std::numeric_limits<double>::infinity());
-            return Value(std::stod(s));
-        } else if (j.contains("$bytes")) {
+        if (j.size() == 1 && j.contains("$integer")) {
+            return Value(std::bit_cast<int64_t>(decode_le64(j["$integer"].get<std::string>())));
+        } else if (j.size() == 1 && j.contains("$float")) {
+            auto d = std::bit_cast<double>(decode_le64(j["$float"].get<std::string>()));
+            if (std::isfinite(d) && d != 0) throw std::runtime_error("Float64 should be encoded as a number");
+            return Value(d);
+        } else if (j.size() == 1 && j.contains("$bytes")) {
             // Decode base64 bytes
             std::string encoded = j["$bytes"].get<std::string>();
             auto bytes = base64_decode_bytes(encoded);
             return Value(Bytes(bytes.begin(), bytes.end()));
+        } else if (j.size() == 1 && (j.contains("$set") || j.contains("$map"))) {
+            throw std::runtime_error("Set and Map are not supported Convex values");
         } else {
             // Regular object
             Object obj;
@@ -201,7 +208,7 @@ StateVersion parse_state_version(const json& j) {
     // Timestamp may be encoded as string or number
     if (j.contains("ts")) {
         if (j["ts"].is_string()) {
-            sv.ts = decode_int64(j["ts"].get<std::string>());
+            sv.ts = decode_le64(j["ts"].get<std::string>());
         } else {
             sv.ts = j["ts"].get<uint64_t>();
         }
@@ -209,18 +216,20 @@ StateVersion parse_state_version(const json& j) {
     return sv;
 }
 
-// Parse ErrorPayload from JSON
-ErrorPayload parse_error_payload(const json& j) {
-    ErrorPayload ep;
-    if (j.is_string()) {
-        ep.message = j.get<std::string>();
-    } else if (j.is_object()) {
-        ep.message = j.value("message", "Unknown error");
-        if (j.contains("data")) {
-            ep.data = json_to_value(j["data"]);
+void parse_request_outcome(const json& j, bool& success, std::optional<Value>& result,
+                           std::optional<ErrorPayload>& error) {
+    success = j.at("success").get<bool>();
+    const auto& payload = j.at("result");
+    if (success) {
+        result = json_to_value(payload);
+    } else {
+        ErrorPayload ep;
+        ep.message = payload.get<std::string>();
+        if (j.contains("errorData")) {
+            ep.data = json_to_value(j["errorData"]);
         }
+        error = std::move(ep);
     }
-    return ep;
 }
 
 // Parse LogLines from JSON
@@ -237,6 +246,10 @@ LogLines parse_log_lines(const json& j) {
 }
 
 } // anonymous namespace
+
+std::string Value::export_json() const {
+    return value_to_json(*this, JsonFormat::Export).dump();
+}
 
 // ============================================================================
 // Public API implementation
@@ -268,9 +281,7 @@ std::string serialize_client_message(const ClientMessage& msg) {
             j["connectionCount"] = arg.connection_count;
             j["lastCloseReason"] = arg.last_close_reason;
             if (arg.max_observed_timestamp) {
-                j["maxObservedTimestamp"] = encode_int64(*arg.max_observed_timestamp);
-            } else {
-                j["maxObservedTimestamp"] = nullptr;
+                j["maxObservedTimestamp"] = encode_le64(*arg.max_observed_timestamp);
             }
             if (arg.client_ts) {
                 j["clientTs"] = *arg.client_ts;
@@ -324,13 +335,16 @@ std::string serialize_client_message(const ClientMessage& msg) {
             j["baseVersion"] = arg.base_version;
             switch (arg.token.type) {
                 case AuthenticationToken::Type::None:
-                    j["token"] = json{{"tokenType", "None"}};
+                    j["tokenType"] = "None";
                     break;
                 case AuthenticationToken::Type::User:
-                    j["token"] = json{{"tokenType", "User"}, {"value", arg.token.value}};
+                    j["tokenType"] = "User";
+                    j["value"] = arg.token.value;
                     break;
                 case AuthenticationToken::Type::Admin:
-                    j["token"] = json{{"tokenType", "Admin"}, {"value", arg.token.value}};
+                    j["tokenType"] = "Admin";
+                    j["value"] = arg.token.value;
+                    if (arg.token.acting_as) j["acting_as"] = value_to_json(Value(*arg.token.acting_as));
                     break;
             }
         }
@@ -368,7 +382,7 @@ ServerMessage parse_server_message(const std::string& json_str) {
                 else if (mod_type == "QueryFailed") {
                     sm.type = StateModification::Type::QueryFailed;
                     sm.error_message = mod.value("errorMessage", "Unknown error");
-                    if (mod.contains("errorData") && !mod["errorData"].is_null()) {
+                    if (mod.contains("errorData")) {
                         sm.error_data = json_to_value(mod["errorData"]);
                     }
                     sm.log_lines = parse_log_lines(mod.value("logLines", json::array()));
@@ -386,7 +400,7 @@ ServerMessage parse_server_message(const std::string& json_str) {
         }
         if (j.contains("serverTs") && !j["serverTs"].is_null()) {
             if (j["serverTs"].is_string()) {
-                msg.server_ts = decode_int64(j["serverTs"].get<std::string>());
+                msg.server_ts = decode_le64(j["serverTs"].get<std::string>());
             } else {
                 msg.server_ts = j["serverTs"].get<uint64_t>();
             }
@@ -399,19 +413,11 @@ ServerMessage parse_server_message(const std::string& json_str) {
         msg.request_id = j.value("requestId", 0u);
         msg.log_lines = parse_log_lines(j.value("logLines", json::array()));
         
-        if (j.contains("result")) {
-            if (j["result"].is_object() && j["result"].contains("error")) {
-                msg.success = false;
-                msg.error = parse_error_payload(j["result"]["error"]);
-            } else {
-                msg.success = true;
-                msg.result = json_to_value(j["result"]);
-            }
-        }
+        parse_request_outcome(j, msg.success, msg.result, msg.error);
         
         if (j.contains("ts") && !j["ts"].is_null()) {
             if (j["ts"].is_string()) {
-                msg.ts = decode_int64(j["ts"].get<std::string>());
+                msg.ts = decode_le64(j["ts"].get<std::string>());
             } else {
                 msg.ts = j["ts"].get<uint64_t>();
             }
@@ -424,15 +430,7 @@ ServerMessage parse_server_message(const std::string& json_str) {
         msg.request_id = j.value("requestId", 0u);
         msg.log_lines = parse_log_lines(j.value("logLines", json::array()));
         
-        if (j.contains("result")) {
-            if (j["result"].is_object() && j["result"].contains("error")) {
-                msg.success = false;
-                msg.error = parse_error_payload(j["result"]["error"]);
-            } else {
-                msg.success = true;
-                msg.result = json_to_value(j["result"]);
-            }
-        }
+        parse_request_outcome(j, msg.success, msg.result, msg.error);
         
         return msg;
     }

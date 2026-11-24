@@ -10,8 +10,27 @@
 #include <queue>
 #include <condition_variable>
 #include <functional>
+#include <utility>
 
 namespace convex {
+
+namespace detail {
+struct QueryBroadcast;
+class ClientWorker;
+}
+
+class QuerySetSubscription {
+public:
+    QuerySetSubscription() = default;
+    // Returns the latest unread transaction snapshot, if one is available.
+    std::optional<QueryResults> next();
+
+private:
+    friend class detail::ClientWorker;
+    explicit QuerySetSubscription(const std::shared_ptr<detail::QueryBroadcast>& broadcast);
+    std::weak_ptr<detail::QueryBroadcast> broadcast_;
+    uint64_t sequence_ = 0;
+};
 
 /**
  * Query subscription handle.
@@ -30,11 +49,13 @@ public:
      * Get the current result (if available)
      */
     std::optional<FunctionResult> current() const;
+    const SubscriberId& id() const { return id_; }
+    std::optional<FunctionResult> next();
     
     /**
      * Check if subscription is active
      */
-    bool is_active() const { return client_ != nullptr; }
+    bool is_active() const { return !worker_.expired(); }
     
     /**
      * Explicitly unsubscribe
@@ -42,11 +63,14 @@ public:
     void unsubscribe();
     
 private:
-    friend class ConvexClient;
-    Subscription(class ConvexClient* client, SubscriberId id);
-    
-    class ConvexClient* client_ = nullptr;
-    SubscriberId id_;
+    friend class detail::ClientWorker;
+    Subscription(std::weak_ptr<detail::ClientWorker> worker, SubscriberId id,
+                 QuerySetSubscription watch, std::optional<FunctionResult> initial);
+
+    std::weak_ptr<detail::ClientWorker> worker_;
+    SubscriberId id_{};
+    QuerySetSubscription watch_;
+    std::optional<FunctionResult> initial_;
 };
 
 /**
@@ -54,7 +78,7 @@ private:
  * 
  * This class manages:
  * - WebSocket connection with automatic reconnection
- * - Background thread for message processing
+ * - Cooperative message processing (`poll()` or `run()`)
  * - Query subscriptions with real-time updates
  * - Mutation and action requests
  * - Authentication
@@ -63,8 +87,8 @@ private:
  * ```cpp
  * ConvexClient client("https://your-app.convex.cloud");
  * 
- * auto sub = client.subscribe("messages:list", {}, [](const Value& result) {
- *     std::cout << "Got update: " << result.to_string() << std::endl;
+ * auto sub = client.subscribe("messages:list", {}, [](const FunctionResult& result) {
+ *     if (result.is_success()) std::cout << result.value.to_string() << '\n';
  * });
  * 
  * client.mutation("messages:send", {
@@ -88,11 +112,9 @@ public:
      */
     ConvexClient(const std::string& deployment_url, std::unique_ptr<ITransport> transport);
     
-    ~ConvexClient();
-    
-    // Non-copyable, non-movable
-    ConvexClient(const ConvexClient&) = delete;
-    ConvexClient& operator=(const ConvexClient&) = delete;
+    // Copies share one connection, worker and subscription set.
+    ConvexClient(const ConvexClient&) = default;
+    ConvexClient& operator=(const ConvexClient&) = default;
     
     // ========================================================================
     // Connection Management
@@ -133,8 +155,9 @@ public:
     Subscription subscribe(
         const std::string& udf_path,
         const Object& args,
-        std::function<void(const FunctionResult&)> on_update
+        std::function<void(const FunctionResult&)> on_update = {}
     );
+    QuerySetSubscription watch_all() const;
     
     /**
      * One-shot query (subscribes, gets result, unsubscribes)
@@ -194,7 +217,9 @@ public:
     /**
      * Set authentication token (e.g., JWT from Auth0/Clerk)
      */
-    void set_auth(const std::string& token);
+    void set_auth(std::optional<std::string> token);
+    void set_auth_callback(AuthCallback fetcher);
+    void set_admin_auth(std::string deploy_key, std::optional<Object> acting_as = {});
     
     /**
      * Clear authentication
@@ -211,8 +236,8 @@ public:
     // ========================================================================
     
     /**
-     * Process pending events (non-blocking)
-     * Call this regularly if not using run().
+     * Drive one iteration if not using run(). A connection attempt or
+     * transport I/O can block depending on the platform.
      */
     void poll();
     
@@ -228,44 +253,33 @@ public:
     void stop();
     
 private:
-    friend class Subscription;
-    
-    void unsubscribe(const SubscriberId& id);
-    void send_message(const ClientMessage& msg);
-    void handle_open();
-    void handle_message(const std::string& msg);
-    void handle_close(const std::string& reason);
-    void handle_error(const std::string& error);
-    void attempt_reconnect();
-    std::string deployment_to_ws_url(const std::string& deployment_url);
-    
-    // Configuration
+    friend class ConvexClientBuilder;
+
+    ConvexClient(const std::string& deployment_url, std::unique_ptr<ITransport> transport,
+                 std::string client_id, std::function<void(ConnectionState)> state_change);
+    std::shared_ptr<detail::ClientWorker> worker_;
+};
+
+using QuerySubscription = Subscription;
+
+class ConvexClientBuilder {
+public:
+    explicit ConvexClientBuilder(std::string deployment_url) : deployment_url_(std::move(deployment_url)) {}
+    ConvexClientBuilder& with_client_id(std::string client_id) {
+        client_id_ = std::move(client_id);
+        return *this;
+    }
+    ConvexClientBuilder& with_on_state_change(std::function<void(ConnectionState)> callback) {
+        state_change_ = std::move(callback);
+        return *this;
+    }
+    ConvexClient build() const;
+    ConvexClient build(std::unique_ptr<ITransport> transport) const;
+
+private:
     std::string deployment_url_;
-    std::string ws_url_;
-    std::string client_id_;
-    
-    // Core components
-    std::unique_ptr<ITransport> transport_;
-    BaseConvexClient base_client_;
-    
-    // Connection state
-    std::string session_id_;
-    uint32_t connection_count_ = 0;
-    std::string last_close_reason_ = "InitialConnect";
-    Backoff backoff_;
-    std::atomic<bool> running_{false};
-    std::atomic<bool> should_reconnect_{true};
-    
-    // Callbacks
-    std::function<void(ConnectionState)> on_connection_change_;
-    
-    // Request queue for thread-safe message sending
-    std::queue<ClientMessage> outgoing_queue_;
-    std::mutex queue_mutex_;
-    
-    // For blocking operations
-    std::mutex sync_mutex_;
-    std::condition_variable sync_cv_;
+    std::string client_id_ = "cpp-convex/0.1.0";
+    std::function<void(ConnectionState)> state_change_;
 };
 
 } // namespace convex

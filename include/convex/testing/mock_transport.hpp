@@ -29,6 +29,7 @@ public:
         client_id_ = client_id;
         
         if (should_fail_connect_) {
+            should_fail_connect_ = false;
             state_ = ConnectionState::Disconnected;
             if (callbacks_.on_error) {
                 callbacks_.on_error(connect_error_message_);
@@ -44,16 +45,15 @@ public:
     }
     
     bool send(const std::string& message) override {
-        std::lock_guard<std::mutex> lock(mutex_);
+        std::unique_lock<std::mutex> lock(mutex_);
         if (state_ != ConnectionState::Connected) {
             return false;
         }
         
         sent_messages_.push(message);
-        
-        if (on_message_sent_) {
-            on_message_sent_(message);
-        }
+        auto callback = on_message_sent_;
+        lock.unlock();
+        if (callback) callback(message);
         
         return true;
     }
@@ -69,7 +69,7 @@ public:
     }
     
     ConnectionState state() const override {
-        std::lock_guard<std::mutex> lock(state_mutex_);
+        std::lock_guard<std::mutex> lock(mutex_);
         return state_;
     }
     
@@ -93,7 +93,7 @@ public:
     }
     
     void run() override {
-        while (state_ == ConnectionState::Connected) {
+        while (state() == ConnectionState::Connected) {
             poll(100);
         }
     }
@@ -203,6 +203,7 @@ public:
     void inject_mutation_response(SessionRequestSeqNumber request_id, const Value& result) {
         std::string msg = R"({
             "type": "MutationResponse",
+            "success": true,
             "requestId": )" + std::to_string(request_id) + R"(,
             "result": )" + serialize_value(result) + R"(,
             "logLines": []
@@ -216,6 +217,7 @@ public:
     void inject_action_response(SessionRequestSeqNumber request_id, const Value& result) {
         std::string msg = R"({
             "type": "ActionResponse",
+            "success": true,
             "requestId": )" + std::to_string(request_id) + R"(,
             "result": )" + serialize_value(result) + R"(,
             "logLines": []
@@ -287,7 +289,6 @@ private:
     mutable std::mutex mutex_;
     
     ConnectionState state_{ConnectionState::Disconnected};
-    mutable std::mutex state_mutex_;
     TransportCallbacks callbacks_;
     
     std::string url_;

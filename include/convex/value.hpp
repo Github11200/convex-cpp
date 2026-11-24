@@ -111,6 +111,8 @@ public:
 
     // String representation
     std::string to_string() const;
+    // Lossy Convex JSON export format, distinct from the sync wire format.
+    std::string export_json() const;
     
     // Get raw variant (for advanced use)
     const auto& raw() const { return data_; }

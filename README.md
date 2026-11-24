@@ -16,7 +16,7 @@ A cross-platform C++ client for [Convex](https://convex.dev), ported from the of
 ```
 ┌─────────────────────────────────────────────────────────────┐
 │                      ConvexClient                           │
-│              (High-level async API)                         │
+│              (Shared client handle / worker)                │
 ├─────────────────────────────────────────────────────────────┤
 │                    BaseConvexClient                         │
 │         (Synchronous state machine - portable)              │
@@ -87,13 +87,10 @@ convex-cplusplus/
 
 ### Manual Build (Linux/macOS/Windows)
 
-```bash
-mkdir build && cd build
-cmake -DCONVEX_BUILD_TESTS=ON ..
-make -j$(nproc)
-
-# Run tests
-./convex_tests
+```sh
+cmake -S . -B build -DCONVEX_BUILD_TESTS=ON
+cmake --build build --config Debug
+ctest --test-dir build -C Debug --output-on-failure
 ```
 
 ### ESP32 (ESP-IDF)
@@ -113,30 +110,27 @@ idf.py build
 
 ```cpp
 #include <convex/convex.hpp>
+#include <iostream>
 
 int main() {
-    convex::ConvexClient client("https://your-app.convex.cloud");
-    
-    // Subscribe to a query
-    auto sub = client.subscribe("messages:list", {});
-    
-    // Receive updates
-    sub.on_update([](const convex::Value& result) {
-        std::cout << "Got update: " << result.to_string() << std::endl;
+    auto client = convex::ConvexClientBuilder("https://your-app.convex.cloud").build();
+    auto sub = client.subscribe("messages:list", {}, [](const convex::FunctionResult& result) {
+        if (result.is_success()) std::cout << result.value.to_string() << '\n';
     });
-    
-    // Call a mutation
-    auto result = client.mutation("messages:send", {
-        {"body", "Hello from C++!"},
-        {"author", "C++ Client"}
-    });
-    
-    // Run event loop
     client.run();
-    
-    return 0;
 }
 ```
+
+Copies of a client share one connection. Use `run()` to drive it continuously,
+or call `poll()` from one task in an existing event loop. `subscribe()` returns a
+`QuerySubscription` that unsubscribes on destruction. Without a callback, use
+`next()` for the newest unread result. `watch_all().next()` reads an atomic
+snapshot of all subscribed queries. Both `next()` methods return immediately.
+
+`query()`, `mutation()`, and `action()` block; do not call them from a client
+callback. To issue a write from a callback, use `mutation_async()` or
+`action_async()`. For authentication, use `set_auth()`, `set_auth_callback()`,
+or `set_admin_auth()`. See [Rust parity and verification](docs/RUST_PARITY.md).
 
 ## Dependencies
 

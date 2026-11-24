@@ -320,11 +320,14 @@ TEST_SUITE("BaseConvexClient - Mutations") {
         std::string server_msg = R"({
             "type": "MutationResponse",
             "requestId": 0,
+            "success": true,
             "result": "mutation result",
             "logLines": []
         })";
         client.handle_message(parse_server_message(server_msg));
-        
+        CHECK(received_id == 999);
+        client.handle_message(TransitionMessage{});
+
         CHECK(received_id == 0);
         CHECK(result.is_success());
         CHECK(result.value.as_string() == "mutation result");
@@ -343,7 +346,8 @@ TEST_SUITE("BaseConvexClient - Mutations") {
         std::string server_msg = R"({
             "type": "MutationResponse",
             "requestId": 0,
-            "result": {"error": "Something went wrong"},
+            "success": false,
+            "result": "Something went wrong",
             "logLines": []
         })";
         client.handle_message(parse_server_message(server_msg));
@@ -382,6 +386,7 @@ TEST_SUITE("BaseConvexClient - Actions") {
         std::string server_msg = R"({
             "type": "ActionResponse",
             "requestId": 0,
+            "success": true,
             "result": {"success": true},
             "logLines": []
         })";
@@ -418,6 +423,48 @@ TEST_SUITE("BaseConvexClient - Authentication") {
 }
 
 TEST_SUITE("BaseConvexClient - Reconnection") {
+    TEST_CASE("Restart replaces the outgoing queue rather than appending stale versions") {
+        BaseConvexClient client(BaseConvexClient::OutgoingMode::QueueMessages);
+        auto first = client.subscribe("a", {}, {}).first;
+        client.subscribe("b", {}, {});
+        client.unsubscribe(first);
+        client.reconnect_messages();
+        auto message = client.pop_next_message();
+        REQUIRE(message);
+        const auto& replay = std::get<ModifyQuerySetMessage>(*message);
+        CHECK(replay.base_version == 0);
+        CHECK(replay.new_version == 1);
+        REQUIRE(replay.modifications.size() == 1);
+        CHECK(replay.modifications.front().query->udf_path == "b.js:default");
+        CHECK_FALSE(client.pop_next_message());
+
+        client.subscribe("c", {}, {});
+        message = client.pop_next_message();
+        REQUIRE(message);
+        CHECK(std::get<ModifyQuerySetMessage>(*message).base_version == 1);
+    }
+
+    TEST_CASE("Canonical paths deduplicate and acknowledged mutations survive auth changes") {
+        BaseConvexClient client;
+        auto [sub, add] = client.subscribe("items", {}, {});
+        auto [second, duplicate] = client.subscribe("items.js:default", {}, {});
+        CHECK(sub.query_id == second.query_id);
+        CHECK_FALSE(duplicate);
+        client.action("test:action", {}, {});
+        std::optional<FunctionResult> result;
+        auto acknowledged = client.mutation("test:mutation", {}, [&](auto, const auto& r) { result = r; });
+        client.handle_message(MutationResponseMessage{1, true, Value("ok"), {}, 42, {}});
+        CHECK_FALSE(result);
+        CHECK(client.max_observed_timestamp() == 42);
+        client.authenticate(AuthenticationToken::user("new-user"));
+        auto replay = client.reconnect_messages();
+        REQUIRE(replay.size() == 3);
+        CHECK(serialize_client_message(replay.back()) == serialize_client_message(acknowledged));
+        client.handle_message(TransitionMessage{});
+        REQUIRE(result);
+        CHECK(result->value.as_string() == "ok");
+    }
+
     
     TEST_CASE("Reconnect messages restore subscriptions") {
         BaseConvexClient client;
@@ -462,24 +509,54 @@ TEST_SUITE("BaseConvexClient - Reconnection") {
         CHECK(found_auth);
     }
     
-    TEST_CASE("Handle failure fails pending requests") {
+    TEST_CASE("Reconnect replays pending actions and mutations in order") {
         BaseConvexClient client;
-        
-        bool callback_called = false;
-        FunctionResult result = FunctionResult::success(Value());
-        
-        client.mutation("test:mutation", {},
-            [&](SessionRequestSeqNumber, const FunctionResult& r) {
-                callback_called = true;
-                result = r;
-            });
-        
-        // Simulate connection failure
-        client.handle_failure();
-        
-        CHECK(callback_called);
-        CHECK(result.is_error());
-        CHECK(result.error_message == "Connection failed");
+        auto mutation = client.mutation("test:mutation", {{"x", Value("y")}}, {});
+        auto action = client.action("test:action", {}, {});
+        auto replay = client.reconnect_messages();
+        REQUIRE(replay.size() == 3);
+        const auto& query_set = std::get<ModifyQuerySetMessage>(replay[0]);
+        CHECK(query_set.base_version == 0);
+        CHECK(query_set.new_version == 1);
+        CHECK(serialize_client_message(replay[1]) == serialize_client_message(mutation));
+        CHECK(serialize_client_message(replay[2]) == serialize_client_message(action));
+    }
+
+    TEST_CASE("Reconnect does not replay unfinished requests under changed auth") {
+        BaseConvexClient client;
+        std::optional<FunctionResult> failure;
+        client.mutation("test:mutation", {}, [&](auto, const auto& result) {
+            failure = result;
+            CHECK_FALSE(client.max_observed_timestamp().has_value());
+        });
+        client.authenticate(AuthenticationToken::user("different-user"));
+        auto current = client.action("test:action", {}, {});
+        auto replay = client.reconnect_messages();
+        REQUIRE(replay.size() == 3);
+        CHECK(std::get<AuthenticateMessage>(replay[0]).base_version == 0);
+        CHECK(serialize_client_message(replay[2]) == serialize_client_message(current));
+        REQUIRE(failure.has_value());
+        CHECK(failure->error_message == "Authentication changed before the request completed");
+    }
+
+    TEST_CASE("Auth fetcher signs out on initial failure and keeps cached token on refresh failure") {
+        BaseConvexClient client;
+        client.authenticate(AuthenticationToken::user("previous"));
+        auto failed = client.set_auth_fetcher([](bool) -> AuthenticationToken {
+            throw std::runtime_error("unavailable");
+        });
+        CHECK(std::get<AuthenticateMessage>(failed).token.type == AuthenticationToken::Type::None);
+        int refreshes = 0;
+        auto set = client.set_auth_fetcher([&](bool force) {
+            if (force && ++refreshes == 2) throw std::runtime_error("unavailable");
+            return AuthenticationToken::user(force ? "refreshed" : "initial");
+        });
+        CHECK(std::get<AuthenticateMessage>(set).token.value == "initial");
+        auto first = client.reconnect_messages();
+        auto second = client.reconnect_messages();
+        CHECK(refreshes == 2);
+        CHECK(std::get<AuthenticateMessage>(first[0]).token.value == "refreshed");
+        CHECK(std::get<AuthenticateMessage>(second[0]).token.value == "refreshed");
     }
 }
 
@@ -512,16 +589,27 @@ TEST_SUITE("BaseConvexClient - Message Handling") {
         CHECK_NOTHROW(client.handle_message(parse_server_message(server_msg)));
     }
     
-    TEST_CASE("Unknown request ID ignored") {
+    TEST_CASE("Unknown request ID is a protocol error") {
         BaseConvexClient client;
         
-        // Response for request that doesn't exist - should not throw
         std::string server_msg = R"({
             "type": "MutationResponse",
             "requestId": 999,
+            "success": true,
             "result": null,
             "logLines": []
         })";
-        CHECK_NOTHROW(client.handle_message(parse_server_message(server_msg)));
+        CHECK_THROWS_WITH(client.handle_message(parse_server_message(server_msg)), "Invalid request id from server");
+    }
+
+    TEST_CASE("Invalid transition does not advance the remote state") {
+        BaseConvexClient client;
+        TransitionMessage transition;
+        transition.start_version.ts = 1;
+        transition.end_version.ts = 10;
+        CHECK_THROWS_WITH(client.handle_message(transition), "StartVersionMismatch");
+        transition.start_version = {};
+        CHECK_NOTHROW(client.handle_message(transition));
+        CHECK_THROWS_WITH(client.handle_message(transition), "StartVersionMismatch");
     }
 }

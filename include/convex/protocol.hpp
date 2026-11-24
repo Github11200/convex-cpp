@@ -66,6 +66,7 @@ struct StateVersion {
     Timestamp ts = 0;
     
     static StateVersion initial() { return {0, 0, 0}; }
+    bool operator==(const StateVersion&) const = default;
     
     bool operator<(const StateVersion& other) const {
         if (ts != other.ts) return ts < other.ts;

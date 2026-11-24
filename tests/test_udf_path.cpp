@@ -48,6 +48,8 @@ TEST_SUITE("ModulePath") {
         CHECK_THROWS(ModulePath("messages/"));
         CHECK_THROWS(ModulePath("api//users"));
         CHECK_THROWS(ModulePath("foo bar"));
+        CHECK_THROWS(ModulePath("a/../b"));
+        CHECK_THROWS(ModulePath("a.ts"));
     }
     
     TEST_CASE("System modules") {
@@ -56,6 +58,10 @@ TEST_SUITE("ModulePath") {
         
         CHECK(system.is_system());
         CHECK_FALSE(normal.is_system());
+        CHECK_FALSE(ModulePath("_other").is_system());
+        CHECK(ModulePath("actions/_deps/whoo.js").is_deps());
+        CHECK(ModulePath("http.js").is_http());
+        CHECK_FALSE(ModulePath("actions/http.js").is_http());
     }
     
     TEST_CASE("Canonicalize") {
@@ -104,8 +110,8 @@ TEST_SUITE("UdfPath") {
         UdfPath p1("messages:list");
         UdfPath p2("messages");
         
-        CHECK(p1.canonicalize() == "messages:list");
-        CHECK(p2.canonicalize() == "messages:default");
+        CHECK(p1.canonicalize() == "messages.js:list");
+        CHECK(p2.canonicalize() == "messages.js:default");
     }
     
     TEST_CASE("to_string") {
@@ -134,7 +140,7 @@ TEST_SUITE("CanonicalizedUdfPath") {
         UdfPath path("messages:list");
         auto canonical = CanonicalizedUdfPath::from_udf_path(path);
         
-        CHECK(canonical.module().str() == "messages");
+        CHECK(canonical.module().str() == "messages.js");
         CHECK(canonical.function().str() == "list");
     }
     
@@ -142,7 +148,7 @@ TEST_SUITE("CanonicalizedUdfPath") {
         UdfPath path("messages");
         auto canonical = CanonicalizedUdfPath::from_udf_path(path);
         
-        CHECK(canonical.module().str() == "messages");
+        CHECK(canonical.module().str() == "messages.js");
         CHECK(canonical.function().str() == "default");
     }
     
@@ -150,6 +156,8 @@ TEST_SUITE("CanonicalizedUdfPath") {
         UdfPath path("api/users:get");
         auto canonical = CanonicalizedUdfPath::from_udf_path(path);
         
-        CHECK(canonical.to_string() == "api/users:get");
+        CHECK(canonical.to_string() == "api/users.js:get");
+        CHECK(canonical.strip().to_string() == "api/users:get");
+        CHECK(CanonicalizedUdfPath::from_udf_path(UdfPath("test")).strip().to_string() == "test");
     }
 }

@@ -9,6 +9,7 @@
 #include <optional>
 #include <queue>
 #include <mutex>
+#include <memory>
 
 namespace convex {
 
@@ -35,7 +36,7 @@ struct SubscriberId {
 struct FunctionResult {
     enum class Type { Value, Error, ConvexError };
     
-    Type type;
+    Type type = Type::Value;
     Value value;
     std::string error_message;
     Value error_data;  // For ConvexError
@@ -54,6 +55,25 @@ struct FunctionResult {
     
     bool is_success() const { return type == Type::Value; }
     bool is_error() const { return type != Type::Value; }
+    bool operator==(const FunctionResult&) const = default;
+};
+
+class QueryResults {
+public:
+    using Entries = std::map<SubscriberId, std::optional<FunctionResult>>;
+    std::optional<FunctionResult> get(const SubscriberId& id) const {
+        auto it = entries_.find(id);
+        return it == entries_.end() ? std::nullopt : it->second;
+    }
+    size_t size() const { return entries_.size(); }
+    size_t len() const { return size(); }
+    bool empty() const { return entries_.empty(); }
+    auto begin() const { return entries_.begin(); }
+    auto end() const { return entries_.end(); }
+
+private:
+    friend class BaseConvexClient;
+    Entries entries_;
 };
 
 /**
@@ -63,6 +83,7 @@ using QueryCallback = std::function<void(const SubscriberId&, const FunctionResu
 using MutationCallback = std::function<void(SessionRequestSeqNumber, const FunctionResult&)>;
 using ActionCallback = std::function<void(SessionRequestSeqNumber, const FunctionResult&)>;
 using AuthCallback = std::function<AuthenticationToken(bool force_refresh)>;
+using AuthTokenFetcher = AuthCallback;
 
 /**
  * Internal query state
@@ -78,12 +99,10 @@ struct LocalQuery {
 /**
  * Pending request
  */
-struct PendingRequest {
-    enum class Type { Mutation, Action };
-    Type type;
-    SessionRequestSeqNumber request_id;
-    MutationCallback on_complete;
-};
+namespace detail {
+class RequestManager;
+class ClientWorker;
+}
 
 /**
  * BaseConvexClient - The synchronous state machine for Convex sync protocol.
@@ -101,7 +120,8 @@ struct PendingRequest {
  */
 class BaseConvexClient {
 public:
-    BaseConvexClient();
+    enum class OutgoingMode { ReturnMessages, QueueMessages };
+    explicit BaseConvexClient(OutgoingMode mode = OutgoingMode::ReturnMessages);
     ~BaseConvexClient();
     
     // ========================================================================
@@ -122,11 +142,14 @@ public:
      * Returns messages to re-subscribe to all active queries and re-authenticate
      */
     std::vector<ClientMessage> reconnect_messages();
+    // In QueueMessages mode, drain generated messages in version order.
+    std::optional<ClientMessage> pop_next_message();
     
     /**
      * Get the max observed timestamp (for reconnection)
      */
     std::optional<Timestamp> max_observed_timestamp() const {
+        std::lock_guard<std::mutex> lock(mutex_);
         return max_observed_ts_;
     }
     
@@ -158,6 +181,7 @@ public:
      * Get current result for a subscription
      */
     std::optional<FunctionResult> get_result(const SubscriberId& subscriber_id) const;
+    QueryResults latest_results() const;
     
     // ========================================================================
     // Mutations and Actions
@@ -196,7 +220,7 @@ public:
     /**
      * Set the authentication token fetcher
      */
-    void set_auth_fetcher(AuthCallback fetcher);
+    ClientMessage set_auth_fetcher(AuthCallback fetcher);
     
     /**
      * Create an authentication message
@@ -216,15 +240,12 @@ public:
      * Handle a message received from the server
      * May trigger callbacks for query updates, mutation responses, etc.
      */
-    void handle_message(const ServerMessage& message);
-    
-    /**
-     * Handle connection failure
-     * Marks all pending requests as failed
-     */
-    void handle_failure();
+    std::optional<QueryResults> handle_message(const ServerMessage& message);
     
 private:
+    friend class detail::ClientWorker;
+    void enqueue_locked(const ClientMessage& message);
+    QueryResults snapshot_locked() const;
     // Query token for deduplication
     std::string make_query_token(const std::string& udf_path, const Object& args) const;
     
@@ -243,11 +264,17 @@ private:
     std::map<SubscriberId, QueryCallback> subscriber_callbacks_;
     
     // Pending requests
-    std::map<SessionRequestSeqNumber, PendingRequest> pending_requests_;
+    std::unique_ptr<detail::RequestManager> requests_;
+    SessionRequestSeqNumber auth_changed_at_ = 0;
+    StateVersion remote_version_{};
+    std::map<QueryId, FunctionResult> remote_results_;
+    bool queue_messages_;
+    std::queue<ClientMessage> outgoing_messages_;
     
     // Authentication
     AuthenticationToken current_token_;
     AuthCallback auth_fetcher_;
+    uint64_t auth_revision_ = 0;
     
     // Thread safety (can be disabled for single-threaded use)
     mutable std::mutex mutex_;

@@ -47,8 +47,14 @@ public:
      * Check if this is a system module (starts with _)
      */
     bool is_system() const {
-        return !path_.empty() && path_[0] == '_';
+        return path_ == "_system" || path_.starts_with("_system/");
     }
+    bool is_deps() const {
+        return path_ == "_deps" || path_.starts_with("_deps/") ||
+               path_ == "actions/_deps" || path_.starts_with("actions/_deps/");
+    }
+    bool is_http() const { return canonicalize() == "http.js"; }
+    bool is_cron() const { return canonicalize() == "crons.js"; }
     
     /**
      * Get the canonicalized path (with .js extension if needed)
@@ -87,6 +93,24 @@ private:
         }
         if (path.find("//") != std::string::npos) {
             throw std::invalid_argument("Module path cannot contain //");
+        }
+        for (size_t start = 0; start < path.size();) {
+            auto end = path.find('/', start);
+            auto component = path.substr(start, end - start);
+            if (component == "." || component == "..") {
+                throw std::invalid_argument("Module path cannot contain . or .. components");
+            }
+            if (end == std::string::npos) {
+                auto extension = component.rfind('.');
+                if (extension == std::string::npos || extension == 0) component += ".js";
+                else if (!component.ends_with(".js")) throw std::invalid_argument("Invalid module extension");
+            }
+            if (component.size() > MAX_IDENTIFIER_LEN ||
+                component.find_first_not_of("_.") == std::string::npos) {
+                throw std::invalid_argument("Invalid module path component: " + component);
+            }
+            if (end == std::string::npos) break;
+            start = end + 1;
         }
     }
     
@@ -157,10 +181,6 @@ public:
      */
     std::string canonicalize() const {
         std::string result = module_.canonicalize();
-        // Remove .js extension for canonical form
-        if (result.length() >= 3 && result.substr(result.length() - 3) == ".js") {
-            result = result.substr(0, result.length() - 3);
-        }
         result += ":";
         result += function_.has_value() ? function_->str() : "default";
         return result;
@@ -197,7 +217,7 @@ public:
     
     static CanonicalizedUdfPath from_udf_path(const UdfPath& path) {
         return CanonicalizedUdfPath(
-            path.module(),
+            ModulePath(path.module().canonicalize()),
             path.function_name().value_or(FunctionName::default_export())
         );
     }
@@ -207,6 +227,13 @@ public:
     
     std::string to_string() const {
         return module_.str() + ":" + function_.str();
+    }
+
+    UdfPath strip() const {
+        auto module = module_.str();
+        if (module.ends_with(".js")) module.resize(module.size() - 3);
+        if (function_ == FunctionName::default_export()) return UdfPath(module);
+        return UdfPath(module + ":" + function_.str());
     }
     
     operator std::string() const { return to_string(); }

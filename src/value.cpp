@@ -1,4 +1,5 @@
 #include "convex/value.hpp"
+#include <bit>
 #include <stdexcept>
 #include <sstream>
 #include <iomanip>
@@ -92,6 +93,9 @@ bool Value::contains(const std::string& key) const {
 }
 
 bool Value::operator==(const Value& other) const {
+    if (is_float64() && other.is_float64()) {
+        return std::bit_cast<uint64_t>(as_float64()) == std::bit_cast<uint64_t>(other.as_float64());
+    }
     return data_ == other.data_;
 }
 

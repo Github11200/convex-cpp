@@ -11,10 +11,6 @@
 #include <mutex>
 #include <atomic>
 
-// Forward declarations for Windows types
-struct HINTERNET__;
-typedef HINTERNET__* HINTERNET;
-
 namespace convex {
 
 /**
@@ -44,9 +40,10 @@ private:
     bool perform_handshake(const std::string& host, int port,
                            const std::string& path, const std::string& client_id);
     
-    HINTERNET session_ = nullptr;
-    HINTERNET connection_ = nullptr;
-    HINTERNET websocket_ = nullptr;
+    // WinHTTP's HINTERNET is a void pointer. Keep SDK headers private.
+    void* session_ = nullptr;
+    void* connection_ = nullptr;
+    void* websocket_ = nullptr;
     
     std::atomic<ConnectionState> state_{ConnectionState::Disconnected};
     TransportCallbacks callbacks_;

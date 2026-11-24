@@ -8,11 +8,58 @@
 #include "convex/protocol.hpp"
 #include "../third_party/nlohmann_json.hpp"
 #include <cmath>
+#include <bit>
+#include <random>
 
 using namespace convex;
 using json = nlohmann::json;
 
 TEST_SUITE("Protocol - Value Serialization") {
+    TEST_CASE("Convex JSON export matches the Rust export fixtures") {
+        CHECK(Value().export_json() == "null");
+        CHECK(Value(true).export_json() == "true");
+        CHECK(Value(false).export_json() == "false");
+        CHECK(Value("abc").export_json() == R"("abc")");
+        CHECK(Value(Bytes{0, 16, 131}).export_json() == R"("ABCD")");
+        CHECK(Value(std::numeric_limits<int64_t>::min()).export_json() == R"("-9223372036854775808")");
+        CHECK(Value(std::numeric_limits<int64_t>::max()).export_json() == R"("9223372036854775807")");
+        CHECK(Value(0LL).export_json() == R"("0")");
+        CHECK(json::parse(Value(12.34).export_json()).get<double>() == 12.34);
+        CHECK(std::signbit(json::parse(Value(-0.0).export_json()).get<double>()));
+        CHECK_FALSE(std::signbit(json::parse(Value(0.0).export_json()).get<double>()));
+        CHECK(Value(std::nan("")).export_json() == R"("NaN")");
+        CHECK(Value(std::numeric_limits<double>::infinity()).export_json() == R"("Infinity")");
+        CHECK(Value(-std::numeric_limits<double>::infinity()).export_json() == R"("-Infinity")");
+        CHECK(Value(Object{{"nested", Value(Array{Value(4LL), Value(true)})}}).export_json() ==
+              R"({"nested":["4",true]})");
+    }
+
+    TEST_CASE("Seeded Convex value round trips preserve float bits and nested values") {
+        std::mt19937_64 random(0x436f6e766578ULL);
+        for (int i = 0; i < 512; ++i) {
+            auto bits = static_cast<uint64_t>(random());
+            Bytes bytes(static_cast<size_t>(random() % 20));
+            for (auto& byte : bytes) byte = static_cast<uint8_t>(random());
+            Value original(Object{
+                {"float", Value(std::bit_cast<double>(bits))},
+                {"rest", Value(Array{Value(std::bit_cast<int64_t>(bits)), Value(bytes), Value()})}
+            });
+            CAPTURE(bits);
+            CHECK(parse_value(serialize_value(original)) == original);
+        }
+        auto nan = Value(std::bit_cast<double>(uint64_t{0x7ff8000000001234}));
+        CHECK(parse_value(serialize_value(nan)) == nan);
+        CHECK(Value(-0.0) != Value(0.0));
+    }
+
+    TEST_CASE("Reject malformed and unsupported encoded values") {
+        CHECK_THROWS(parse_value(R"({"$integer":"AA=="})"));
+        CHECK_THROWS(parse_value(R"({"$float":"AAAAAAAA8D8="})")); // ordinary 1.0
+        CHECK_THROWS(parse_value(R"({"$bytes":"AA==ignored"})"));
+        CHECK_THROWS(parse_value(R"({"$set":[]})"));
+        CHECK_THROWS(parse_value(R"({"$map":[]})"));
+        CHECK(parse_value(R"({"$integer":"ordinary key","other":null})").is_object());
+    }
     
     TEST_CASE("Serialize null") {
         Value v;
@@ -40,21 +87,21 @@ TEST_SUITE("Protocol - Value Serialization") {
             json j = json::parse(s);
             CHECK(j.is_object());
             CHECK(j.contains("$float"));
-            CHECK(j["$float"] == "NaN");
+            CHECK(std::isnan(parse_value(s).as_float64()));
         }
         
         SUBCASE("Infinity") {
             Value v(std::numeric_limits<double>::infinity());
             std::string s = serialize_value(v);
             json j = json::parse(s);
-            CHECK(j["$float"] == "Infinity");
+            CHECK(j["$float"] == "AAAAAAAA8H8=");
         }
         
         SUBCASE("Negative infinity") {
             Value v(-std::numeric_limits<double>::infinity());
             std::string s = serialize_value(v);
             json j = json::parse(s);
-            CHECK(j["$float"] == "-Infinity");
+            CHECK(j["$float"] == "AAAAAAAA8P8=");
         }
     }
     
@@ -137,11 +184,10 @@ TEST_SUITE("Protocol - Value Serialization") {
             CHECK(v.as_float64() == doctest::Approx(3.14));
         }
         
-        SUBCASE("Parse integer as int") {
+        SUBCASE("Parse integer-shaped JSON number as float") {
             Value v = parse_value("42");
-            // JSON integers are parsed as int64
-            CHECK(v.is_int64());
-            CHECK(v.as_int64() == 42);
+            CHECK(v.is_float64());
+            CHECK(v.as_float64() == 42);
         }
         
         SUBCASE("Parse string") {
@@ -170,16 +216,22 @@ TEST_SUITE("Protocol - Value Serialization") {
         }
         
         SUBCASE("Parse $float NaN") {
-            Value v = parse_value("{\"$float\": \"NaN\"}");
+            Value v = parse_value("{\"$float\": \"AAAAAAAA+H8=\"}");
             CHECK(v.is_float64());
             CHECK(std::isnan(v.as_float64()));
         }
         
         SUBCASE("Parse $float Infinity") {
-            Value v = parse_value("{\"$float\": \"Infinity\"}");
+            Value v = parse_value("{\"$float\": \"AAAAAAAA8H8=\"}");
             CHECK(v.is_float64());
             CHECK(std::isinf(v.as_float64()));
             CHECK(v.as_float64() > 0);
+        }
+
+        SUBCASE("Negative zero preserves its sign") {
+            auto encoded = serialize_value(Value(-0.0));
+            CHECK(json::parse(encoded)["$float"] == "AAAAAAAAAIA=");
+            CHECK(std::signbit(parse_value(encoded).as_float64()));
         }
     }
     
@@ -223,7 +275,7 @@ TEST_SUITE("Protocol - Client Messages") {
         CHECK(j["sessionId"] == "test-session-123");
         CHECK(j["connectionCount"] == 5);
         CHECK(j["lastCloseReason"] == "TestReason");
-        CHECK(j["maxObservedTimestamp"].is_null());
+        CHECK_FALSE(j.contains("maxObservedTimestamp"));
     }
     
     TEST_CASE("Serialize Connect with timestamp") {
@@ -336,8 +388,8 @@ TEST_SUITE("Protocol - Client Messages") {
             
             CHECK(j["type"] == "Authenticate");
             CHECK(j["baseVersion"] == 0);
-            CHECK(j["token"]["tokenType"] == "User");
-            CHECK(j["token"]["value"] == "jwt-token-here");
+            CHECK(j["tokenType"] == "User");
+            CHECK(j["value"] == "jwt-token-here");
         }
         
         SUBCASE("No token") {
@@ -349,7 +401,7 @@ TEST_SUITE("Protocol - Client Messages") {
             std::string s = serialize_client_message(cm);
             json j = json::parse(s);
             
-            CHECK(j["token"]["tokenType"] == "None");
+            CHECK(j["tokenType"] == "None");
         }
     }
     
@@ -484,6 +536,7 @@ TEST_SUITE("Protocol - Server Messages") {
         std::string msg = R"({
             "type": "MutationResponse",
             "requestId": 1,
+            "success": true,
             "result": {"_id": "new-id"},
             "logLines": []
         })";
@@ -501,6 +554,7 @@ TEST_SUITE("Protocol - Server Messages") {
         std::string msg = R"({
             "type": "ActionResponse",
             "requestId": 5,
+            "success": true,
             "result": "action result",
             "logLines": ["Action log"]
         })";
@@ -513,6 +567,38 @@ TEST_SUITE("Protocol - Server Messages") {
         CHECK(arm.result.has_value());
         CHECK(arm.result->as_string() == "action result");
         CHECK(arm.log_lines.size() == 1);
+    }
+
+    TEST_CASE("Request outcomes preserve errors and successful error fields") {
+        auto ok = std::get<MutationResponseMessage>(parse_server_message(
+            R"({"type":"MutationResponse","requestId":1,"success":true,"result":{"error":"ordinary data"}})"));
+        CHECK(ok.success);
+        CHECK(ok.result->as_object().at("error").as_string() == "ordinary data");
+        auto fail = std::get<ActionResponseMessage>(parse_server_message(
+            R"({"type":"ActionResponse","requestId":2,"success":false,"result":"failed","errorData":{"code":42}})"));
+        CHECK_FALSE(fail.success);
+        REQUIRE(fail.error.has_value());
+        CHECK(fail.error->message == "failed");
+        REQUIRE(fail.error->data.has_value());
+        CHECK(fail.error->data->as_object().at("code").as_float64() == 42);
+    }
+
+    TEST_CASE("Null application error data and unsigned timestamp survive decoding") {
+        auto response = std::get<MutationResponseMessage>(parse_server_message(
+            R"({"type":"MutationResponse","requestId":1,"success":false,"result":"failed","errorData":null,"ts":"//////////8="})"));
+        REQUIRE(response.error);
+        REQUIRE(response.error->data);
+        CHECK(response.error->data->is_null());
+        CHECK(response.ts == std::numeric_limits<uint64_t>::max());
+        auto transition = std::get<TransitionMessage>(parse_server_message(R"({
+            "type":"Transition",
+            "startVersion":{"querySet":0,"identity":0,"ts":"AAAAAAAAAAA="},
+            "endVersion":{"querySet":1,"identity":0,"ts":"AQAAAAAAAAA="},
+            "modifications":[{"type":"QueryFailed","queryId":0,"errorMessage":"failed","errorData":null}]
+        })"));
+        REQUIRE(transition.modifications.at(0).error_data);
+        CHECK(transition.modifications.at(0).error_data->is_null());
+        CHECK(transition.end_version.ts == 1);
     }
     
     TEST_CASE("Parse unknown message type throws") {

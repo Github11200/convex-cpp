@@ -102,6 +102,7 @@ if(CONVEX_BUILD_TESTS AND NOT CONVEX_PLATFORM STREQUAL "ESP32")
     
     # Register tests with CTest
     add_test(NAME convex_tests COMMAND convex_tests)
+    set_tests_properties(convex_tests PROPERTIES TIMEOUT 30)
     
     # Convenience target
     add_custom_target(test_all

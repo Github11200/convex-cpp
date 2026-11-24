@@ -130,8 +130,8 @@ static void convex_task(void* pvParameters) {
                     // Example: Extract a value from the config
                     if (result.value.is_object() && 
                         result.value.contains("interval")) {
-                        int64_t interval = result.value["interval"].as_int64();
-                        ESP_LOGI(TAG, "Sensor interval: %lld ms", interval);
+                        double interval = result.value["interval"].as_float64();
+                        ESP_LOGI(TAG, "Sensor interval: %g ms", interval);
                     }
                 } else {
                     ESP_LOGE(TAG, "Query error: %s", 
