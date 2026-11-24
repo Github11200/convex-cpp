@@ -1,0 +1,1 @@
+/usr/bin/c++ -g -Wl,--dependency-file=CMakeFiles/simple_subscribe.dir/link.d CMakeFiles/simple_subscribe.dir/examples/simple_subscribe.cpp.o -o simple_subscribe  libconvex.a /usr/lib/libssl.so /usr/lib/libcrypto.so -lpthread

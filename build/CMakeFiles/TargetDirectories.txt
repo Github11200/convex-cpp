@@ -1,0 +1,12 @@
+/home/arch/Desktop/code/convex-cplusplus/build/CMakeFiles/convex.dir
+/home/arch/Desktop/code/convex-cplusplus/build/CMakeFiles/simple_subscribe.dir
+/home/arch/Desktop/code/convex-cplusplus/build/CMakeFiles/mutation_example.dir
+/home/arch/Desktop/code/convex-cplusplus/build/CMakeFiles/convex_tests.dir
+/home/arch/Desktop/code/convex-cplusplus/build/CMakeFiles/test_all.dir
+/home/arch/Desktop/code/convex-cplusplus/build/CMakeFiles/test.dir
+/home/arch/Desktop/code/convex-cplusplus/build/CMakeFiles/edit_cache.dir
+/home/arch/Desktop/code/convex-cplusplus/build/CMakeFiles/rebuild_cache.dir
+/home/arch/Desktop/code/convex-cplusplus/build/CMakeFiles/list_install_components.dir
+/home/arch/Desktop/code/convex-cplusplus/build/CMakeFiles/install.dir
+/home/arch/Desktop/code/convex-cplusplus/build/CMakeFiles/install/local.dir
+/home/arch/Desktop/code/convex-cplusplus/build/CMakeFiles/install/strip.dir
